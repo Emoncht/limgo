@@ -287,35 +287,11 @@ func Execute(payload Payload) ExecuteResult {
 		groupResults := make([]ItemResult, len(group))
 
 		payInitURL := cfg.BaseURL + "/api/shop/pay/init?region=BD&language=en"
-		var fireStart time.Time
-
+		
+		prebuiltReqs := make([]*http.Request, len(reqItems))
 		for i, item := range reqItems {
-			burstWG.Add(1)
-			go func(idx int, ri ReqItem) {
-				defer burstWG.Done()
-
-				<-startChan
-				reqLaunchTime := time.Now()
-				startOffsetMs := reqLaunchTime.Sub(fireStart).Milliseconds()
-
-				req, err := http.NewRequest("POST", payInitURL, bytes.NewReader(ri.PayloadBytes))
-				if err != nil {
-					durationMs := time.Since(reqLaunchTime).Milliseconds()
-					fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, error=%v\n",
-						idx+1, ri.Player.RefID, startOffsetMs, durationMs, err)
-					groupResults[idx] = ItemResult{
-						RefID:         ri.Player.RefID,
-						Status:        "Failed",
-						GameID:        ri.Player.GameID,
-						Nickname:      playerInfo.Nickname,
-						Region:        playerInfo.Region,
-						DurationMs:    durationMs,
-						StartOffsetMs: startOffsetMs,
-						Response:      map[string]string{"error": err.Error()},
-					}
-					return
-				}
-
+			req, err := http.NewRequest("POST", payInitURL, bytes.NewReader(item.PayloadBytes))
+			if err == nil {
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Accept", "application/json")
 				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -331,6 +307,35 @@ func Execute(payload Payload) ExecuteResult {
 				req.Header.Set("X-Csrf-Token", csrfToken)
 				req.Header.Set("Cookie", fmt.Sprintf("_ga=GA1.2.325429135.1717080814; _gid=GA1.2.1086323533.1725767898; source=pc; b.vnpopup.1=1; session_key=%s; datadome=%s; __csrf__=%s",
 					cfg.SessionKey, ddResult.ClientID, csrfToken))
+			}
+			prebuiltReqs[i] = req
+		}
+
+		fmt.Printf("[GoWorker] ⚡ %d HTTP requests pre-built. Distributing to goroutines...\n", len(reqItems))
+
+		var fireStart time.Time
+
+		for i, item := range reqItems {
+			burstWG.Add(1)
+			go func(idx int, ri ReqItem, req *http.Request) {
+				defer burstWG.Done()
+
+				<-startChan
+				reqLaunchTime := time.Now()
+				startOffsetMs := reqLaunchTime.Sub(fireStart).Milliseconds()
+
+				if req == nil {
+					groupResults[idx] = ItemResult{
+						RefID:         ri.Player.RefID,
+						Status:        "Failed",
+						GameID:        ri.Player.GameID,
+						Nickname:      playerInfo.Nickname,
+						Region:        playerInfo.Region,
+						StartOffsetMs: startOffsetMs,
+						Response:      map[string]string{"error": "failed to pre-build request"},
+					}
+					return
+				}
 
 				resp, err := fastClient.Do(req)
 				durationMs := time.Since(reqLaunchTime).Milliseconds()
@@ -389,7 +394,7 @@ func Execute(payload Payload) ExecuteResult {
 					StartOffsetMs: startOffsetMs,
 					Response:      resObj,
 				}
-			}(i, item)
+			}(i, item, prebuiltReqs[i])
 		}
 
 		fireStart = time.Now()
