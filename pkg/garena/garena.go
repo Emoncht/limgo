@@ -127,25 +127,41 @@ func LoginGarena(cfg Config, client *http.Client) (MerchantInfo, error) {
 }
 
 func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client) (PlayerLoginResult, error) {
-	var proxyClient *http.Client
-	if cfg.Proxy != "" {
-		proxyURL, err := url.Parse(cfg.Proxy)
-		if err == nil {
-			transport := &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
-			}
-			proxyClient = &http.Client{
-				Transport: transport,
-				Timeout:   25 * time.Second,
-			}
-		}
-	}
-	if proxyClient == nil {
-		proxyClient = defaultClient
-	}
-
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		var proxyClient *http.Client
+		if cfg.Proxy != "" {
+			proxyURLStr := cfg.Proxy
+			if strings.Contains(proxyURLStr, "gw.dataimpulse.com") {
+				sessID := fmt.Sprintf("%d", time.Now().UnixNano()%1000000)
+				u, err := url.Parse(proxyURLStr)
+				if err == nil && u.User != nil {
+					user := u.User.Username()
+					pass, _ := u.User.Password()
+					// Strip existing session info if present, then append fresh session ID
+					if idx := strings.Index(user, ";sessttl"); idx != -1 {
+						user = user[:idx]
+					}
+					newUser := fmt.Sprintf("%s;sessttl.5;sessid.%s", user, sessID)
+					u.User = url.UserPassword(newUser, pass)
+					proxyURLStr = u.String()
+				}
+			}
+			proxyURL, err := url.Parse(proxyURLStr)
+			if err == nil {
+				transport := &http.Transport{
+					Proxy: http.ProxyURL(proxyURL),
+				}
+				proxyClient = &http.Client{
+					Transport: transport,
+					Timeout:   25 * time.Second,
+				}
+			}
+		}
+		if proxyClient == nil {
+			proxyClient = defaultClient
+		}
+
 		payload, _ := json.Marshal(map[string]interface{}{
 			"app_id":   cfg.AppID,
 			"login_id": gameID,
@@ -189,14 +205,18 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 		if res.Error == "invalid_id" {
 			return PlayerLoginResult{Error: "invalid_id"}, nil
 		}
-		if res.Error == "" && res.Nickname != "" {
+		if resp.StatusCode == 200 && res.Error == "" && res.Nickname != "" {
 			return PlayerLoginResult{Nickname: res.Nickname, Region: res.Region}, nil
 		}
 
 		if attempt < maxRetries {
 			time.Sleep(2 * time.Second)
 		} else {
-			return PlayerLoginResult{Error: res.Error}, nil
+			errReason := res.Error
+			if errReason == "" {
+				errReason = fmt.Sprintf("DataDome captcha block (HTTP %d)", resp.StatusCode)
+			}
+			return PlayerLoginResult{Error: errReason}, nil
 		}
 	}
 
