@@ -126,7 +126,7 @@ func LoginGarena(cfg Config, client *http.Client) (MerchantInfo, error) {
 	}, nil
 }
 
-func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client) (PlayerLoginResult, error) {
+func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client) (PlayerLoginResult, *http.Client, error) {
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		var proxyClient *http.Client
@@ -171,7 +171,7 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 
 		req, err := http.NewRequest("POST", cfg.BaseURL+"/api/auth/player_id_login", bytes.NewBuffer(payload))
 		if err != nil {
-			return PlayerLoginResult{}, err
+			return PlayerLoginResult{}, proxyClient, err
 		}
 		req.Header.Set("Connection", "keep-alive")
 		req.Header.Set("Content-Type", "application/json")
@@ -195,7 +195,7 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 				time.Sleep(2 * time.Second)
 				continue
 			}
-			return PlayerLoginResult{Error: err.Error()}, nil
+			return PlayerLoginResult{Error: err.Error()}, proxyClient, nil
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -211,10 +211,10 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 		json.Unmarshal(body, &res)
 
 		if res.Error == "invalid_id" {
-			return PlayerLoginResult{Error: "invalid_id"}, nil
+			return PlayerLoginResult{Error: "invalid_id"}, proxyClient, nil
 		}
 		if resp.StatusCode == 200 && res.Error == "" && res.Nickname != "" {
-			return PlayerLoginResult{Nickname: res.Nickname, Region: res.Region}, nil
+			return PlayerLoginResult{Nickname: res.Nickname, Region: res.Region}, proxyClient, nil
 		}
 
 		if attempt < maxRetries {
@@ -224,11 +224,11 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 			if errReason == "" {
 				errReason = fmt.Sprintf("DataDome captcha block (HTTP %d)", resp.StatusCode)
 			}
-			return PlayerLoginResult{Error: errReason}, nil
+			return PlayerLoginResult{Error: errReason}, proxyClient, nil
 		}
 	}
 
-	return PlayerLoginResult{Error: "Login failed after max retries"}, nil
+	return PlayerLoginResult{Error: "Login failed after max retries"}, defaultClient, nil
 }
 
 func GetEventPricing(cfg Config, client *http.Client) (EventPricingData, error) {

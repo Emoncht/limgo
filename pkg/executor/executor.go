@@ -118,7 +118,7 @@ func Execute(payload Payload) ExecuteResult {
 	for gameID, group := range playerGroups {
 		fmt.Printf("[GoWorker] 🔒 Processing group for Player: %s (%d order(s))\n", gameID, len(group))
 
-		playerInfo, err := garena.LoginPlayerWithRetry(gameID, cfg, fastClient)
+		playerInfo, activeClient, err := garena.LoginPlayerWithRetry(gameID, cfg, fastClient)
 		if err != nil || playerInfo.Error != "" {
 			errStr := playerInfo.Error
 			if errStr == "" && err != nil {
@@ -137,7 +137,7 @@ func Execute(payload Payload) ExecuteResult {
 		}
 		fmt.Printf("[GoWorker] 🎮 Player logged in: Nickname=%s, Region=%s\n", playerInfo.Nickname, playerInfo.Region)
 
-		pricing, _ := garena.GetEventPricing(cfg, fastClient)
+		pricing, _ := garena.GetEventPricing(cfg, activeClient)
 		verification := garena.VerifyShellCost(pricing, cfg)
 
 		if !verification.Eligible && verification.ErrorCode != "" {
