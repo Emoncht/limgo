@@ -173,12 +173,20 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 		if err != nil {
 			return PlayerLoginResult{}, err
 		}
+		req.Header.Set("Connection", "keep-alive")
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`)
+		req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
+		req.Header.Set("Sec-Ch-Ua-Platform", `"Android"`)
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
 		req.Header.Set("Origin", cfg.BaseURL)
 		req.Header.Set("Referer", cfg.BaseURL+"/")
-		req.Header.Set("Cookie", fmt.Sprintf("source=pc; session_key=%s; datadome=%s;", cfg.SessionKey, ddResult.ClientID))
+		req.Header.Set("Accept-Language", "en-GB,en;q=0.9,zh-MO;q=0.8,zh;q=0.7,id-ID;q=0.6,id;q=0.5,en-US;q=0.4")
+		req.Header.Set("Cookie", fmt.Sprintf("_ga=GA1.2.325429135.1717080814; _gid=GA1.2.1086323533.1725767898; source=pc; b.vnpopup.1=1; session_key=%s; datadome=%s; _gat=1;", cfg.SessionKey, ddResult.ClientID))
 
 		resp, err := proxyClient.Do(req)
 		if err != nil {
