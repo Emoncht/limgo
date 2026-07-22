@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"lim-worker-go/pkg/datadome"
 )
 
 type Config struct {
@@ -39,10 +41,10 @@ type PlayerLoginResult struct {
 
 type EventPricingData struct {
 	EventInfo struct {
-		ID           int               `json:"id"`
-		Status       int               `json:"status"`
-		EligibleItem int               `json:"eligible_item"`
-		CurrencyDict map[string]int    `json:"currency_dict"`
+		ID           int                    `json:"id"`
+		Status       int                    `json:"status"`
+		EligibleItem int                    `json:"eligible_item"`
+		CurrencyDict map[string]interface{} `json:"currency_dict"`
 	} `json:"event_info"`
 	Channels []struct {
 		Channel int `json:"channel"`
@@ -143,13 +145,18 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 			"login_id": gameID,
 		})
 
+		ddResult, _ := datadome.GenerateCookie(cfg.BaseURL+"/api/auth/player_id_login", proxyClient)
+
 		req, err := http.NewRequest("POST", cfg.BaseURL+"/api/auth/player_id_login", bytes.NewBuffer(payload))
 		if err != nil {
 			return PlayerLoginResult{}, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		req.Header.Set("Cookie", fmt.Sprintf("source=pc; session_key=%s;", cfg.SessionKey))
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+		req.Header.Set("Origin", cfg.BaseURL)
+		req.Header.Set("Referer", cfg.BaseURL+"/")
+		req.Header.Set("Cookie", fmt.Sprintf("source=pc; session_key=%s; datadome=%s;", cfg.SessionKey, ddResult.ClientID))
 
 		resp, err := proxyClient.Do(req)
 		if err != nil {
@@ -223,7 +230,16 @@ func VerifyShellCost(pricing EventPricingData, cfg Config) VerificationResult {
 
 	eligibleItemID := eventInfo.EligibleItem
 	eventID := eventInfo.ID
-	originalPrice := eventInfo.CurrencyDict["GS"]
+
+	var originalPrice float64
+	if gsVal, ok := eventInfo.CurrencyDict["GS"]; ok {
+		switch v := gsVal.(type) {
+		case float64:
+			originalPrice = v
+		case int:
+			originalPrice = float64(v)
+		}
+	}
 
 	if eligibleItemID == 0 || originalPrice == 0 {
 		return VerificationResult{Eligible: false, Reason: "Missing eligible_item or original price in event_info"}
@@ -245,13 +261,14 @@ func VerifyShellCost(pricing EventPricingData, cfg Config) VerificationResult {
 		return VerificationResult{Eligible: false, Reason: "Item not found in channel items"}
 	}
 
-	discountPercent := ((originalPrice - shellCost) * 100) / originalPrice
+	intOriginalPrice := int(originalPrice)
+	discountPercent := ((intOriginalPrice - shellCost) * 100) / intOriginalPrice
 
 	res := VerificationResult{
 		EligibleItemID:  eligibleItemID,
 		EventID:         eventID,
 		ShellCost:       shellCost,
-		OriginalPrice:   originalPrice,
+		OriginalPrice:   intOriginalPrice,
 		DiscountPercent: discountPercent,
 	}
 
