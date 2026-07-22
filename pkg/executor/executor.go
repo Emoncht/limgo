@@ -16,12 +16,7 @@ import (
 	"lim-worker-go/pkg/totp"
 )
 
-var sessionMutexes sync.Map
-
-func getSessionMutex(key string) *sync.Mutex {
-	v, _ := sessionMutexes.LoadOrStore(key, &sync.Mutex{})
-	return v.(*sync.Mutex)
-}
+var globalExecutionMutex sync.Mutex
 
 type PlayerOrder struct {
 	RefID  string `json:"refid"`
@@ -65,6 +60,9 @@ func randomSessionID() string {
 }
 
 func Execute(payload Payload) ExecuteResult {
+	globalExecutionMutex.Lock()
+	defer globalExecutionMutex.Unlock()
+
 	startTime := time.Now()
 	cfg := payload.Config
 	if cfg.BaseURL == "" {
@@ -127,11 +125,6 @@ func Execute(payload Payload) ExecuteResult {
 	for gameID, group := range playerGroups {
 		func(gameID string, group []PlayerOrder) {
 			fmt.Printf("[GoWorker] 🔒 Processing group for Player: %s (%d order(s))\n", gameID, len(group))
-
-			mu := getSessionMutex(cfg.SessionKey)
-			mu.Lock()
-			defer mu.Unlock()
-			fmt.Printf("[GoWorker] 🔒 [MUTEX LOCKED] Player group: %s\n", gameID)
 
 			playerInfo, activeClient, err := garena.LoginPlayerWithRetry(gameID, cfg, fastClient)
 			if err != nil || playerInfo.Error != "" {
@@ -240,6 +233,23 @@ func Execute(payload Payload) ExecuteResult {
 			fmt.Printf("[GoWorker] ✅ Session player ID matches expected game_id: %s\n", gameID)
 		}
 
+		fmt.Printf("[GoWorker] 🔥 Pre-heating %d TCP/TLS connections...\n", len(group))
+		var heatWG sync.WaitGroup
+		for i := 0; i < len(group); i++ {
+			heatWG.Add(1)
+			go func() {
+				defer heatWG.Done()
+				req, _ := http.NewRequest("GET", cfg.BaseURL+"/api/preflight", nil)
+				req.Header.Set("Cookie", fmt.Sprintf("session_key=%s", cfg.SessionKey))
+				resp, err := fastClient.Do(req)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}()
+		}
+		heatWG.Wait()
+		fmt.Println("[GoWorker] 🔥 Connections pre-warmed in pool.")
 
 		sharedSessionID := randomSessionID()
 		type ReqItem struct {
@@ -272,108 +282,120 @@ func Execute(payload Payload) ExecuteResult {
 			reqItems[i] = ReqItem{Player: p, PayloadBytes: pb}
 		}
 
+		startChan := make(chan struct{})
+		var burstWG sync.WaitGroup
 		groupResults := make([]ItemResult, len(group))
 
 		payInitURL := cfg.BaseURL + "/api/shop/pay/init?region=BD&language=en"
-		fireStart := time.Now()
+		var fireStart time.Time
 
-		for i, ri := range reqItems {
-			reqLaunchTime := time.Now()
-			startOffsetMs := reqLaunchTime.Sub(fireStart).Milliseconds()
+		for i, item := range reqItems {
+			burstWG.Add(1)
+			go func(idx int, ri ReqItem) {
+				defer burstWG.Done()
 
-			req, err := http.NewRequest("POST", payInitURL, bytes.NewReader(ri.PayloadBytes))
-			if err != nil {
+				<-startChan
+				reqLaunchTime := time.Now()
+				startOffsetMs := reqLaunchTime.Sub(fireStart).Milliseconds()
+
+				req, err := http.NewRequest("POST", payInitURL, bytes.NewReader(ri.PayloadBytes))
+				if err != nil {
+					durationMs := time.Since(reqLaunchTime).Milliseconds()
+					fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, error=%v\n",
+						idx+1, ri.Player.RefID, startOffsetMs, durationMs, err)
+					groupResults[idx] = ItemResult{
+						RefID:         ri.Player.RefID,
+						Status:        "Failed",
+						GameID:        ri.Player.GameID,
+						Nickname:      playerInfo.Nickname,
+						Region:        playerInfo.Region,
+						DurationMs:    durationMs,
+						StartOffsetMs: startOffsetMs,
+						Response:      map[string]string{"error": err.Error()},
+					}
+					return
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Accept", "application/json")
+				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+				req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`)
+				req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
+				req.Header.Set("Sec-Ch-Ua-Platform", `"Android"`)
+				req.Header.Set("Sec-Fetch-Site", "same-origin")
+				req.Header.Set("Sec-Fetch-Mode", "cors")
+				req.Header.Set("Sec-Fetch-Dest", "empty")
+				req.Header.Set("Origin", cfg.BaseURL)
+				req.Header.Set("Referer", cfg.BaseURL+"/")
+				req.Header.Set("Accept-Language", "en-GB,en;q=0.9,zh-MO;q=0.8,zh;q=0.7,id-ID;q=0.6,id;q=0.5,en-US;q=0.4")
+				req.Header.Set("X-Csrf-Token", csrfToken)
+				req.Header.Set("Cookie", fmt.Sprintf("_ga=GA1.2.325429135.1717080814; _gid=GA1.2.1086323533.1725767898; source=pc; b.vnpopup.1=1; session_key=%s; datadome=%s; __csrf__=%s",
+					cfg.SessionKey, ddResult.ClientID, csrfToken))
+
+				resp, err := fastClient.Do(req)
 				durationMs := time.Since(reqLaunchTime).Milliseconds()
-				fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, error=%v\n",
-					i+1, ri.Player.RefID, startOffsetMs, durationMs, err)
-				groupResults[i] = ItemResult{
-					RefID:         ri.Player.RefID,
-					Status:        "Failed",
-					GameID:        ri.Player.GameID,
-					Nickname:      playerInfo.Nickname,
-					Region:        playerInfo.Region,
-					DurationMs:    durationMs,
-					StartOffsetMs: startOffsetMs,
-					Response:      map[string]string{"error": err.Error()},
+
+				if err != nil {
+					fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, error=%v\n",
+						idx+1, ri.Player.RefID, startOffsetMs, durationMs, err)
+					groupResults[idx] = ItemResult{
+						RefID:         ri.Player.RefID,
+						Status:        "Failed",
+						GameID:        ri.Player.GameID,
+						Nickname:      playerInfo.Nickname,
+						Region:        playerInfo.Region,
+						DurationMs:    durationMs,
+						StartOffsetMs: startOffsetMs,
+						Response:      map[string]string{"error": err.Error()},
+					}
+					return
 				}
-				continue
-			}
 
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "application/json")
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-			req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`)
-			req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
-			req.Header.Set("Sec-Ch-Ua-Platform", `"Android"`)
-			req.Header.Set("Sec-Fetch-Site", "same-origin")
-			req.Header.Set("Sec-Fetch-Mode", "cors")
-			req.Header.Set("Sec-Fetch-Dest", "empty")
-			req.Header.Set("Origin", cfg.BaseURL)
-			req.Header.Set("Referer", cfg.BaseURL+"/")
-			req.Header.Set("Accept-Language", "en-GB,en;q=0.9,zh-MO;q=0.8,zh;q=0.7,id-ID;q=0.6,id;q=0.5,en-US;q=0.4")
-			req.Header.Set("X-Csrf-Token", csrfToken)
-			req.Header.Set("Cookie", fmt.Sprintf("_ga=GA1.2.325429135.1717080814; _gid=GA1.2.1086323533.1725767898; source=pc; b.vnpopup.1=1; session_key=%s; datadome=%s; __csrf__=%s",
-				cfg.SessionKey, ddResult.ClientID, csrfToken))
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
 
-			resp, err := fastClient.Do(req)
-			durationMs := time.Since(reqLaunchTime).Milliseconds()
+				var resObj map[string]interface{}
+				json.Unmarshal(body, &resObj)
 
-			if err != nil {
-				fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, error=%v\n",
-					i+1, ri.Player.RefID, startOffsetMs, durationMs, err)
-				groupResults[i] = ItemResult{
-					RefID:         ri.Player.RefID,
-					Status:        "Failed",
-					GameID:        ri.Player.GameID,
-					Nickname:      playerInfo.Nickname,
-					Region:        playerInfo.Region,
-					DurationMs:    durationMs,
-					StartOffsetMs: startOffsetMs,
-					Response:      map[string]string{"error": err.Error()},
-				}
-				continue
-			}
+				resultStatus := "Failed"
+				displayID := "0"
+				resCode := "unknown"
 
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-
-			var resObj map[string]interface{}
-			json.Unmarshal(body, &resObj)
-
-			resultStatus := "Failed"
-			displayID := "0"
-			resCode := "unknown"
-
-			if resObj != nil {
-				if r, ok := resObj["result"].(string); ok {
-					resCode = r
-					if r == "success" {
-						resultStatus = "Success"
-					} else if r == "error_2sa_otp" {
-						resultStatus = "Processing"
+				if resObj != nil {
+					if r, ok := resObj["result"].(string); ok {
+						resCode = r
+						if r == "success" {
+							resultStatus = "Success"
+						} else if r == "error_2sa_otp" {
+							resultStatus = "Processing"
+						}
+					}
+					if d, ok := resObj["display_id"].(string); ok {
+						displayID = d
 					}
 				}
-				if d, ok := resObj["display_id"].(string); ok {
-					displayID = d
+
+				fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, result=%s, display_id=%s\n",
+					idx+1, ri.Player.RefID, startOffsetMs, durationMs, resCode, displayID)
+
+				groupResults[idx] = ItemResult{
+					RefID:         ri.Player.RefID,
+					Status:        resultStatus,
+					GameID:        ri.Player.GameID,
+					Nickname:      playerInfo.Nickname,
+					Region:        playerInfo.Region,
+					DisplayID:     displayID,
+					DurationMs:    durationMs,
+					StartOffsetMs: startOffsetMs,
+					Response:      resObj,
 				}
-			}
-
-			fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, result=%s, display_id=%s\n",
-				i+1, ri.Player.RefID, startOffsetMs, durationMs, resCode, displayID)
-
-			groupResults[i] = ItemResult{
-				RefID:         ri.Player.RefID,
-				Status:        resultStatus,
-				GameID:        ri.Player.GameID,
-				Nickname:      playerInfo.Nickname,
-				Region:        playerInfo.Region,
-				DisplayID:     displayID,
-				DurationMs:    durationMs,
-				StartOffsetMs: startOffsetMs,
-				Response:      resObj,
-			}
+			}(i, item)
 		}
 
+		fireStart = time.Now()
+		close(startChan)
+
+		burstWG.Wait()
 		fireDuration := time.Since(fireStart).Milliseconds()
 
 		var succCount, ineligCount, failCount int
