@@ -77,14 +77,17 @@ func LoginGarena(cfg Config, client *http.Client) (MerchantInfo, error) {
 	if err != nil {
 		return MerchantInfo{}, err
 	}
-	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	fmt.Printf("[GoWorker] 📡 GET /api/auth/check_session [%d]: %s\n", resp.StatusCode, string(body))
 
 	var sess struct {
 		SessionKey string `json:"session_key"`
 		Login      bool   `json:"login"`
 		Error      string `json:"error"`
 	}
-	json.NewDecoder(resp.Body).Decode(&sess)
+	json.Unmarshal(body, &sess)
 
 	if sess.SessionKey == "" || !sess.Login {
 		return MerchantInfo{Error: "error_require_login"}, nil
@@ -103,14 +106,17 @@ func LoginGarena(cfg Config, client *http.Client) (MerchantInfo, error) {
 	if err != nil {
 		return MerchantInfo{}, err
 	}
-	defer ssoResp.Body.Close()
+	ssoBody, _ := io.ReadAll(ssoResp.Body)
+	ssoResp.Body.Close()
+
+	fmt.Printf("[GoWorker] 📡 POST /api/auth/sso [%d]: %s\n", ssoResp.StatusCode, string(ssoBody))
 
 	var ssoRes struct {
 		UID          int64  `json:"uid"`
 		ShellBalance int    `json:"shell_balance"`
 		Error        string `json:"error"`
 	}
-	json.NewDecoder(ssoResp.Body).Decode(&ssoRes)
+	json.Unmarshal(ssoBody, &ssoRes)
 
 	return MerchantInfo{
 		UID:          ssoRes.UID,
@@ -160,6 +166,7 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 
 		resp, err := proxyClient.Do(req)
 		if err != nil {
+			fmt.Printf("[GoWorker] ❌ POST /api/auth/player_id_login Attempt %d/%d HTTP Error: %v\n", attempt, maxRetries, err)
 			if attempt < maxRetries {
 				time.Sleep(2 * time.Second)
 				continue
@@ -169,6 +176,8 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+
+		fmt.Printf("[GoWorker] 📡 POST /api/auth/player_id_login [%d] Attempt %d/%d: %s\n", resp.StatusCode, attempt, maxRetries, string(body))
 
 		var res struct {
 			Nickname string `json:"nickname"`
@@ -180,7 +189,7 @@ func LoginPlayerWithRetry(gameID string, cfg Config, defaultClient *http.Client)
 		if res.Error == "invalid_id" {
 			return PlayerLoginResult{Error: "invalid_id"}, nil
 		}
-		if res.Error == "" {
+		if res.Error == "" && res.Nickname != "" {
 			return PlayerLoginResult{Nickname: res.Nickname, Region: res.Region}, nil
 		}
 
@@ -206,17 +215,24 @@ func GetEventPricing(cfg Config, client *http.Client) (EventPricingData, error) 
 
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("[GoWorker] ❌ GET /api/shop/apps/event_pricing HTTP Error: %v\n", err)
 		return EventPricingData{}, err
 	}
-	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	fmt.Printf("[GoWorker] 📡 GET /api/shop/apps/event_pricing [%d]: %s\n", resp.StatusCode, string(body))
 
 	var data EventPricingData
-	err = json.NewDecoder(resp.Body).Decode(&data)
+	err = json.Unmarshal(body, &data)
 	return data, err
 }
 
 func VerifyShellCost(pricing EventPricingData, cfg Config) VerificationResult {
 	eventInfo := pricing.EventInfo
+	fmt.Printf("[GoWorker] 🔍 VerifyShellCost Debug — event_id: %d, status: %d, eligible_item: %d, currency_dict: %v\n",
+		eventInfo.ID, eventInfo.Status, eventInfo.EligibleItem, eventInfo.CurrencyDict)
+
 	if eventInfo.ID == 0 {
 		return VerificationResult{Eligible: false, Reason: "No event_info in pricing response"}
 	}
