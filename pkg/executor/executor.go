@@ -16,6 +16,13 @@ import (
 	"lim-worker-go/pkg/totp"
 )
 
+var sessionMutexes sync.Map
+
+func getSessionMutex(key string) *sync.Mutex {
+	v, _ := sessionMutexes.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 type PlayerOrder struct {
 	RefID  string `json:"refid"`
 	GameID string `json:"game_id"`
@@ -33,8 +40,9 @@ type ItemResult struct {
 	RefID         string      `json:"refid"`
 	Status        string      `json:"status"`
 	GameID        string      `json:"game_id"`
-	Nickname      string      `json:"nickname,omitempty"`
-	Region        string      `json:"region,omitempty"`
+	Nickname      string      `json:"nickname"`
+	Region        string      `json:"region"`
+	DisplayID     string      `json:"display_id,omitempty"`
 	DurationMs    int64       `json:"duration_ms"`
 	StartOffsetMs int64       `json:"start_offset_ms"`
 	Response      interface{} `json:"response"`
@@ -117,26 +125,32 @@ func Execute(payload Payload) ExecuteResult {
 	var resultsMutex sync.Mutex
 
 	for gameID, group := range playerGroups {
-		fmt.Printf("[GoWorker] 🔒 Processing group for Player: %s (%d order(s))\n", gameID, len(group))
+		func(gameID string, group []PlayerOrder) {
+			fmt.Printf("[GoWorker] 🔒 Processing group for Player: %s (%d order(s))\n", gameID, len(group))
 
-		playerInfo, activeClient, err := garena.LoginPlayerWithRetry(gameID, cfg, fastClient)
-		if err != nil || playerInfo.Error != "" {
-			errStr := playerInfo.Error
-			if errStr == "" && err != nil {
-				errStr = err.Error()
+			mu := getSessionMutex(cfg.SessionKey)
+			mu.Lock()
+			defer mu.Unlock()
+			fmt.Printf("[GoWorker] 🔒 [MUTEX LOCKED] Player group: %s\n", gameID)
+
+			playerInfo, activeClient, err := garena.LoginPlayerWithRetry(gameID, cfg, fastClient)
+			if err != nil || playerInfo.Error != "" {
+				errStr := playerInfo.Error
+				if errStr == "" && err != nil {
+					errStr = err.Error()
+				}
+				fmt.Printf("[GoWorker] ❌ Player login failed for %s: %s\n", gameID, errStr)
+				for _, p := range group {
+					finalResults = append(finalResults, ItemResult{
+						RefID:    p.RefID,
+						Status:   "Failed",
+						GameID:   p.GameID,
+						Response: map[string]string{"error": errStr},
+					})
+				}
+				return
 			}
-			fmt.Printf("[GoWorker] ❌ Player login failed for %s: %s\n", gameID, errStr)
-			for _, p := range group {
-				finalResults = append(finalResults, ItemResult{
-					RefID:    p.RefID,
-					Status:   "Failed",
-					GameID:   p.GameID,
-					Response: map[string]string{"error": errStr},
-				})
-			}
-			continue
-		}
-		fmt.Printf("[GoWorker] 🎮 Player logged in: Nickname=%s, Region=%s\n", playerInfo.Nickname, playerInfo.Region)
+			fmt.Printf("[GoWorker] 🎮 Player logged in: Nickname=%s, Region=%s\n", playerInfo.Nickname, playerInfo.Region)
 
 		pricing, _ := garena.GetEventPricing(cfg, activeClient)
 		verification := garena.VerifyShellCost(pricing, cfg)
@@ -159,7 +173,7 @@ func Execute(payload Payload) ExecuteResult {
 					},
 				})
 			}
-			continue
+			return
 		}
 
 		useItemID := verification.EligibleItemID
@@ -197,6 +211,34 @@ func Execute(payload Payload) ExecuteResult {
 
 		preWG.Wait()
 		fmt.Printf("[GoWorker] 🔑 CSRF and DataDome pre-fetched (DataDome CID: %s...)\n", ddResult.ClientID[:min(20, len(ddResult.ClientID))])
+
+		fmt.Printf("[GoWorker] 🔍 Verifying currently bound Player ID for session...\n")
+		isBound, boundID, _ := garena.VerifyBoundPlayer(cfg, fastClient, gameID)
+		if !isBound {
+			fmt.Printf("[GoWorker] ⚠️ Player session hijacked (expected %s, currently bound %s). Re-binding...\n", gameID, boundID)
+			reLogin, _, reErr := garena.LoginPlayerWithRetry(gameID, cfg, fastClient)
+			if reErr != nil || reLogin.Error != "" {
+				errStr := reLogin.Error
+				if errStr == "" && reErr != nil {
+					errStr = reErr.Error()
+				}
+				fmt.Printf("[GoWorker] ❌ Failed to re-bind player: %s\n", errStr)
+				for _, p := range group {
+					finalResults = append(finalResults, ItemResult{
+						RefID:    p.RefID,
+						Status:   "Failed",
+						GameID:   p.GameID,
+						Nickname: playerInfo.Nickname,
+						Region:   playerInfo.Region,
+						Response: map[string]string{"error": "session_hijacked_rebind_failed: " + errStr},
+					})
+				}
+				return
+			}
+			fmt.Printf("[GoWorker] ✅ Re-bound to player: %s successfully\n", gameID)
+		} else {
+			fmt.Printf("[GoWorker] ✅ Session player ID matches expected game_id: %s\n", gameID)
+		}
 
 		fmt.Printf("[GoWorker] 🔥 Pre-heating %d TCP/TLS connections...\n", len(group))
 		var heatWG sync.WaitGroup
@@ -283,11 +325,18 @@ func Execute(payload Payload) ExecuteResult {
 
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Accept", "application/json")
-				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+				req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`)
+				req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
+				req.Header.Set("Sec-Ch-Ua-Platform", `"Android"`)
+				req.Header.Set("Sec-Fetch-Site", "same-origin")
+				req.Header.Set("Sec-Fetch-Mode", "cors")
+				req.Header.Set("Sec-Fetch-Dest", "empty")
 				req.Header.Set("Origin", cfg.BaseURL)
 				req.Header.Set("Referer", cfg.BaseURL+"/")
+				req.Header.Set("Accept-Language", "en-GB,en;q=0.9,zh-MO;q=0.8,zh;q=0.7,id-ID;q=0.6,id;q=0.5,en-US;q=0.4")
 				req.Header.Set("X-Csrf-Token", csrfToken)
-				req.Header.Set("Cookie", fmt.Sprintf("source=pc; session_key=%s; datadome=%s; __csrf__=%s",
+				req.Header.Set("Cookie", fmt.Sprintf("_ga=GA1.2.325429135.1717080814; _gid=GA1.2.1086323533.1725767898; source=pc; b.vnpopup.1=1; session_key=%s; datadome=%s; __csrf__=%s",
 					cfg.SessionKey, ddResult.ClientID, csrfToken))
 
 				resp, err := fastClient.Do(req)
@@ -342,6 +391,7 @@ func Execute(payload Payload) ExecuteResult {
 					GameID:        ri.Player.GameID,
 					Nickname:      playerInfo.Nickname,
 					Region:        playerInfo.Region,
+					DisplayID:     displayID,
 					DurationMs:    durationMs,
 					StartOffsetMs: startOffsetMs,
 					Response:      resObj,
@@ -372,6 +422,7 @@ func Execute(payload Payload) ExecuteResult {
 		resultsMutex.Lock()
 		finalResults = append(finalResults, groupResults...)
 		resultsMutex.Unlock()
+		}(gameID, group)
 	}
 
 	postMerchant, _ := garena.LoginGarena(cfg, fastClient)

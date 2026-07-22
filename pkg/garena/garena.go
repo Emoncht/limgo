@@ -363,3 +363,27 @@ func GetCSRFToken(cfg Config, client *http.Client) (string, error) {
 
 	return strconv.FormatInt(time.Now().UnixNano(), 10), nil
 }
+
+func VerifyBoundPlayer(cfg Config, client *http.Client, expectedGameID string) (bool, string, error) {
+	req, err := http.NewRequest("GET", cfg.BaseURL+"/api/auth/get_user_info/multi", nil)
+	if err != nil {
+		return false, "", err
+	}
+	req.Header.Set("Cookie", fmt.Sprintf("source=pc; session_key=%s;", cfg.SessionKey))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, "", err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var res struct {
+		PlayerID struct {
+			LoginID string `json:"login_id"`
+		} `json:"player_id"`
+	}
+	json.Unmarshal(body, &res)
+
+	return res.PlayerID.LoginID == expectedGameID, res.PlayerID.LoginID, nil
+}
