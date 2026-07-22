@@ -45,6 +45,7 @@ type ExecuteResult struct {
 	Error              string       `json:"error,omitempty"`
 	ShellBalanceBefore int          `json:"shell_balance_before"`
 	ShellBalanceAfter  int          `json:"shell_balance_after"`
+	ShellSpent         int          `json:"shell_spent"`
 	FireDurationMs     int64        `json:"fire_duration_ms"`
 	Results            []ItemResult `json:"results"`
 }
@@ -379,10 +380,16 @@ func Execute(payload Payload) ExecuteResult {
 		shellBalanceAfter = shellBalanceBefore
 	}
 
+	shellSpent := shellBalanceBefore - shellBalanceAfter
+	if shellSpent < 0 {
+		shellSpent = 0
+	}
+
 	return ExecuteResult{
 		Success:            true,
 		ShellBalanceBefore: shellBalanceBefore,
 		ShellBalanceAfter:  shellBalanceAfter,
+		ShellSpent:         shellSpent,
 		FireDurationMs:     time.Since(startTime).Milliseconds(),
 		Results:            finalResults,
 	}
