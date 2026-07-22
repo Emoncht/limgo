@@ -22,20 +22,22 @@ type PlayerOrder struct {
 }
 
 type Payload struct {
-	SessionKey string              `json:"session_key"`
-	FAToken    string              `json:"fa_token"`
-	Proxy      string              `json:"proxy"`
-	Players    []PlayerOrder       `json:"players"`
-	Config     garena.Config       `json:"config"`
+	SessionKey string        `json:"session_key"`
+	FAToken    string        `json:"fa_token"`
+	Proxy      string        `json:"proxy"`
+	Players    []PlayerOrder `json:"players"`
+	Config     garena.Config `json:"config"`
 }
 
 type ItemResult struct {
-	RefID    string      `json:"refid"`
-	Status   string      `json:"status"`
-	GameID   string      `json:"game_id"`
-	Nickname string      `json:"nickname,omitempty"`
-	Region   string      `json:"region,omitempty"`
-	Response interface{} `json:"response"`
+	RefID         string      `json:"refid"`
+	Status        string      `json:"status"`
+	GameID        string      `json:"game_id"`
+	Nickname      string      `json:"nickname,omitempty"`
+	Region        string      `json:"region,omitempty"`
+	DurationMs    int64       `json:"duration_ms"`
+	StartOffsetMs int64       `json:"start_offset_ms"`
+	Response      interface{} `json:"response"`
 }
 
 type ExecuteResult struct {
@@ -77,7 +79,6 @@ func Execute(payload Payload) ExecuteResult {
 	cfg.SessionKey = payload.SessionKey
 	cfg.Proxy = payload.Proxy
 
-	// Configure HTTP client with a warm connection pool (high MaxConns per host)
 	transport := &http.Transport{
 		MaxIdleConns:        200,
 		MaxIdleConnsPerHost: 200,
@@ -93,7 +94,6 @@ func Execute(payload Payload) ExecuteResult {
 
 	fmt.Printf("[GoWorker] 🚀 Processing %d player(s)\n", len(payload.Players))
 
-	// 1. Authenticate Merchant
 	merchant, err := garena.LoginGarena(cfg, fastClient)
 	if err != nil {
 		return ExecuteResult{
@@ -105,8 +105,8 @@ func Execute(payload Payload) ExecuteResult {
 		cfg.SessionKey = merchant.SessionKey
 	}
 	shellBalanceBefore := merchant.ShellBalance
+	fmt.Printf("[GoWorker] 🔐 Merchant authenticated — UID: %d, Shell Balance: %d\n", merchant.UID, shellBalanceBefore)
 
-	// Group players by GameID
 	playerGroups := make(map[string][]PlayerOrder)
 	for _, p := range payload.Players {
 		playerGroups[p.GameID] = append(playerGroups[p.GameID], p)
@@ -116,15 +116,15 @@ func Execute(payload Payload) ExecuteResult {
 	var resultsMutex sync.Mutex
 
 	for gameID, group := range playerGroups {
-		fmt.Printf("[GoWorker] 🔒 Processing group for Player: %s (%d orders)\n", gameID, len(group))
+		fmt.Printf("[GoWorker] 🔒 Processing group for Player: %s (%d order(s))\n", gameID, len(group))
 
-		// 2. Player Login
 		playerInfo, err := garena.LoginPlayerWithRetry(gameID, cfg, fastClient)
 		if err != nil || playerInfo.Error != "" {
 			errStr := playerInfo.Error
 			if errStr == "" && err != nil {
 				errStr = err.Error()
 			}
+			fmt.Printf("[GoWorker] ❌ Player login failed for %s: %s\n", gameID, errStr)
 			for _, p := range group {
 				finalResults = append(finalResults, ItemResult{
 					RefID:    p.RefID,
@@ -135,12 +135,13 @@ func Execute(payload Payload) ExecuteResult {
 			}
 			continue
 		}
+		fmt.Printf("[GoWorker] 🎮 Player logged in: Nickname=%s, Region=%s\n", playerInfo.Nickname, playerInfo.Region)
 
-		// 3. Event Pricing & Shell Verification
 		pricing, _ := garena.GetEventPricing(cfg, fastClient)
 		verification := garena.VerifyShellCost(pricing, cfg)
 
 		if !verification.Eligible && verification.ErrorCode != "" {
+			fmt.Printf("[GoWorker] ❌ Shell verification failed: %s\n", verification.Reason)
 			for _, p := range group {
 				finalResults = append(finalResults, ItemResult{
 					RefID:    p.RefID,
@@ -165,16 +166,19 @@ func Execute(payload Payload) ExecuteResult {
 		if !verification.Eligible {
 			useItemID = 2883
 			useEventID = pricing.EventInfo.ID
+			fmt.Printf("[GoWorker] ⚠️ Shell verification ineligible (%s), attempting anyway...\n", verification.Reason)
+		} else {
+			fmt.Printf("[GoWorker] ✅ Shell verification PASSED: item_id=%d, shell_cost=%d (%d%% discount)\n",
+				useItemID, verification.ShellCost, verification.DiscountPercent)
 		}
 
-		// 4. Generate OTP
 		otpCode, err := totp.GenerateOTP(payload.FAToken)
 		if err != nil {
 			fmt.Printf("[GoWorker] ⚠️ TOTP error: %v, falling back to default\n", err)
 			otpCode = "000000"
 		}
+		fmt.Printf("[GoWorker] 🔢 OTP generated: %s\n", otpCode)
 
-		// 5. Fetch CSRF token & DataDome cookie concurrently
 		var csrfToken string
 		var ddResult datadome.DataDomeResult
 		var preWG sync.WaitGroup
@@ -191,8 +195,8 @@ func Execute(payload Payload) ExecuteResult {
 		}()
 
 		preWG.Wait()
+		fmt.Printf("[GoWorker] 🔑 CSRF and DataDome pre-fetched (DataDome CID: %s...)\n", ddResult.ClientID[:min(20, len(ddResult.ClientID))])
 
-		// 6. Pre-heat TCP/TLS connections to bdgamesbazar.com
 		fmt.Printf("[GoWorker] 🔥 Pre-heating %d TCP/TLS connections...\n", len(group))
 		var heatWG sync.WaitGroup
 		for i := 0; i < len(group); i++ {
@@ -211,7 +215,6 @@ func Execute(payload Payload) ExecuteResult {
 		heatWG.Wait()
 		fmt.Println("[GoWorker] 🔥 Connections pre-warmed in pool.")
 
-		// 7. Pre-build request payloads & raw JSON bytes
 		sharedSessionID := randomSessionID()
 		type ReqItem struct {
 			Player       PlayerOrder
@@ -243,32 +246,36 @@ func Execute(payload Payload) ExecuteResult {
 			reqItems[i] = ReqItem{Player: p, PayloadBytes: pb}
 		}
 
-		// 8. SYNCHRONIZED GOROUTINE BURST ENGINE
-		// Using a closed channel barrier for zero-jitter microsecond launch
 		startChan := make(chan struct{})
 		var burstWG sync.WaitGroup
 		groupResults := make([]ItemResult, len(group))
 
 		payInitURL := cfg.BaseURL + "/api/shop/pay/init?region=BD&language=en"
+		var fireStart time.Time
 
 		for i, item := range reqItems {
 			burstWG.Add(1)
 			go func(idx int, ri ReqItem) {
 				defer burstWG.Done()
 
-				// Synchronized Barrier Wait
 				<-startChan
+				reqLaunchTime := time.Now()
+				startOffsetMs := reqLaunchTime.Sub(fireStart).Milliseconds()
 
-				// Instant launch!
 				req, err := http.NewRequest("POST", payInitURL, bytes.NewReader(ri.PayloadBytes))
 				if err != nil {
+					durationMs := time.Since(reqLaunchTime).Milliseconds()
+					fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, error=%v\n",
+						idx+1, ri.Player.RefID, startOffsetMs, durationMs, err)
 					groupResults[idx] = ItemResult{
-						RefID:    ri.Player.RefID,
-						Status:   "Failed",
-						GameID:   ri.Player.GameID,
-						Nickname: playerInfo.Nickname,
-						Region:   playerInfo.Region,
-						Response: map[string]string{"error": err.Error()},
+						RefID:         ri.Player.RefID,
+						Status:        "Failed",
+						GameID:        ri.Player.GameID,
+						Nickname:      playerInfo.Nickname,
+						Region:        playerInfo.Region,
+						DurationMs:    durationMs,
+						StartOffsetMs: startOffsetMs,
+						Response:      map[string]string{"error": err.Error()},
 					}
 					return
 				}
@@ -283,14 +290,20 @@ func Execute(payload Payload) ExecuteResult {
 					cfg.SessionKey, ddResult.ClientID, csrfToken))
 
 				resp, err := fastClient.Do(req)
+				durationMs := time.Since(reqLaunchTime).Milliseconds()
+
 				if err != nil {
+					fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, error=%v\n",
+						idx+1, ri.Player.RefID, startOffsetMs, durationMs, err)
 					groupResults[idx] = ItemResult{
-						RefID:    ri.Player.RefID,
-						Status:   "Failed",
-						GameID:   ri.Player.GameID,
-						Nickname: playerInfo.Nickname,
-						Region:   playerInfo.Region,
-						Response: map[string]string{"error": err.Error()},
+						RefID:         ri.Player.RefID,
+						Status:        "Failed",
+						GameID:        ri.Player.GameID,
+						Nickname:      playerInfo.Nickname,
+						Region:        playerInfo.Region,
+						DurationMs:    durationMs,
+						StartOffsetMs: startOffsetMs,
+						Response:      map[string]string{"error": err.Error()},
 					}
 					return
 				}
@@ -302,40 +315,64 @@ func Execute(payload Payload) ExecuteResult {
 				json.Unmarshal(body, &resObj)
 
 				resultStatus := "Failed"
+				displayID := "0"
+				resCode := "unknown"
+
 				if resObj != nil {
-					if r, ok := resObj["result"].(string); ok && r == "success" {
-						resultStatus = "Success"
-					} else if r == "error_2sa_otp" {
-						resultStatus = "Processing"
+					if r, ok := resObj["result"].(string); ok {
+						resCode = r
+						if r == "success" {
+							resultStatus = "Success"
+						} else if r == "error_2sa_otp" {
+							resultStatus = "Processing"
+						}
+					}
+					if d, ok := resObj["display_id"].(string); ok {
+						displayID = d
 					}
 				}
 
+				fmt.Printf("[GoWorker] 🔫 Fire #%d [%s]: offset=%dms, duration=%dms, result=%s, display_id=%s\n",
+					idx+1, ri.Player.RefID, startOffsetMs, durationMs, resCode, displayID)
+
 				groupResults[idx] = ItemResult{
-					RefID:    ri.Player.RefID,
-					Status:   resultStatus,
-					GameID:   ri.Player.GameID,
-					Nickname: playerInfo.Nickname,
-					Region:   playerInfo.Region,
-					Response: resObj,
+					RefID:         ri.Player.RefID,
+					Status:        resultStatus,
+					GameID:        ri.Player.GameID,
+					Nickname:      playerInfo.Nickname,
+					Region:        playerInfo.Region,
+					DurationMs:    durationMs,
+					StartOffsetMs: startOffsetMs,
+					Response:      resObj,
 				}
 			}(i, item)
 		}
 
-		// ⚡⚡ UNLEASH ALL GOROUTINES AT THE EXACT SAME MICROSECOND ⚡⚡
-		fireStart := time.Now()
+		fireStart = time.Now()
 		close(startChan)
 
-		// Wait for all burst requests to finish
 		burstWG.Wait()
 		fireDuration := time.Since(fireStart).Milliseconds()
-		fmt.Printf("⚡ [GoWorker] All %d pay/init requests completed in %dms!\n", len(group), fireDuration)
+
+		var succCount, ineligCount, failCount int
+		for _, res := range groupResults {
+			if res.Status == "Success" {
+				succCount++
+			} else if respMap, ok := res.Response.(map[string]interface{}); ok && respMap["result"] == "error_init_event_not_eligible" {
+				ineligCount++
+			} else {
+				failCount++
+			}
+		}
+
+		fmt.Printf("⚡ [GoWorker] Burst completed in %dms! Total: %d | Success: %d | Ineligible: %d | Other Failed: %d\n",
+			fireDuration, len(group), succCount, ineligCount, failCount)
 
 		resultsMutex.Lock()
 		finalResults = append(finalResults, groupResults...)
 		resultsMutex.Unlock()
 	}
 
-	// Post-execution shell balance check
 	postMerchant, _ := garena.LoginGarena(cfg, fastClient)
 	shellBalanceAfter := postMerchant.ShellBalance
 	if shellBalanceAfter == 0 && postMerchant.Error != "" {
@@ -349,4 +386,11 @@ func Execute(payload Payload) ExecuteResult {
 		FireDurationMs:     time.Since(startTime).Milliseconds(),
 		Results:            finalResults,
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
